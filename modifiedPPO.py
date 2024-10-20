@@ -12,9 +12,9 @@ from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticP
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn, obs_as_tensor
 from typing import Type, Optional, Union, Dict, Any, List, Tuple
-
+from collections import deque
+print("Modified PPO imported")
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
-
 
 class PolicyAnchoredPPO(OnPolicyAlgorithm):
     """
@@ -105,7 +105,7 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
         verbose: int = 0,
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
-        anchor_pol_sample_size: int = 100,
+        anchor_pol_sample_size: int = 300,
         anchor_pol_kl_coef: float = 0.1,
         gp_threshold: float = 0.5,
         gp_k: int = 5,
@@ -180,8 +180,13 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
         self.good_policies: List[Tuple[ActorCriticPolicy, float]] = []  # List of (policy, reward)
         self.td_alpha = td_alpha  # Sensitivity parameter for task change detection
         self.previous_rewards = []  # Buffer to store rewards of the previous training step
-
-
+        self.td_counter = 0  # Counter to keep track of task changes
+        self._ep_length = 2048
+        self._reward_grad_window = ((100_000 + self._ep_length) // self._ep_length)  # Max length of the reward gradient buffer
+        self.reward_grad_threshold = -0.001 # Threshold angle for the reward gradient (tan theta)
+        self.episodic_rewards = deque(maxlen=self._reward_grad_window)  # Buffer to store rewards of the previous training steps
+        self.anchor_policy_timestep = -1  # Timestep at which the anchor policy was recorded
+        
         if _init_setup_model:
             self._setup_model()
 
@@ -238,8 +243,8 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
 
                 # KL div with anchor
                 with th.no_grad():
-                    sampled_states = np.array([self.env.observation_space.sample() for _ in range(self.anchor_pol_sample_size)])
-                    sampled_states = obs_as_tensor(sampled_states, self.device)
+                    sampled_state_indices = th.randint(0, rollout_data.observations.shape[0], (self.anchor_pol_sample_size,))
+                    sampled_states = rollout_data.observations[sampled_state_indices]
                     if self.anchor_policy is not None:
                         _, _, anchor_policy_log_probs = self.anchor_policy(sampled_states)
                         # anchor_policy_log_probs = th.log(anchor_policy_probs)
@@ -322,6 +327,7 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
         current_rewards = [ep_info['r'] for ep_info in self.ep_info_buffer]
         accumulated_rewards = np.mean(current_rewards)
 
+        self.episodic_rewards.append(accumulated_rewards)
         self.detect_task_change(current_rewards)
 
         self.previous_rewards = current_rewards
@@ -338,6 +344,9 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/policy_loss", policy_loss.item())
+        self.logger.record("train/policy_loss_main_term", -th.min(policy_loss_1, policy_loss_2).mean().item())
+        self.logger.record("train/policy_loss_div_term", (self.anchor_pol_kl_coef * anchor_policy_kl_div).item())
         self.logger.record("train/anchor_kl_div", anchor_policy_kl_div.item())
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
@@ -370,13 +379,12 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
         Check if the policy is a 'good' policy based on the reward and update the list.
         """
         if reward >= self.gp_threshold or task_change:
-            print("Anchoring Policy...")
-            self.good_policies.append((policy, reward))
+            print("Saving good Policy...")
+            self.good_policies.append((policy, reward, self.num_timesteps))
 
             # Sort based on rewards in descending order and keep only top k policies
-            self.good_policies.sort(key=lambda x: x[1], reverse=True)
+            self.good_policies.sort(key=lambda x: x[2], reverse=True)
             self.good_policies = self.good_policies[:self.gp_k]
-            self.anchor_policy = self.good_policies[0][0]
 
     def detect_task_change(self, current_rewards: List[float]):
         """
@@ -391,14 +399,18 @@ class PolicyAnchoredPPO(OnPolicyAlgorithm):
         # Calculate mean and standard deviation of previous rewards
         prev_mean = np.mean(self.previous_rewards)
         prev_std = np.std(self.previous_rewards)
-
+        mean_gradient = np.mean(np.diff(self.episodic_rewards) / self._ep_length) * (len(self.episodic_rewards) > 35)
+        
         # Calculate mean of current rewards
         current_mean = np.mean(current_rewards)
 
         # Check if there's a sharp decline (current rewards < prev_mean - alpha * prev_std)
-        if current_mean < (1 - np.sign(current_mean) * self.td_alpha) * prev_mean  :
+        if self.num_timesteps % 1e4 == 0:
             print(f"Task change detected! Current rewards: {current_mean:.2f}, Previous mean: {prev_mean:.2f}, Std: {prev_std:.2f}")
-            self.update_good_policies(self.policy, current_mean, task_change=True)
+            self.td_counter += 1
+            self.anchor_policy = self.good_policies[0][0]
+            # print("Policy Taken: ", self.good_policies[0][2])
+            self.anchor_policy_timestep = self.good_policies[0][2]
 
     def get_good_policies(self):
         """
